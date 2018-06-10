@@ -3,12 +3,15 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"reflect"
 	"strconv"
 
+	"cloud.google.com/go/storage"
 	"github.com/pborman/uuid"
+	"golang.org/x/net/context"
 	elastic "gopkg.in/olivere/elastic.v3"
 )
 
@@ -21,13 +24,16 @@ type Post struct {
 	User     string   `json:"user"`
 	Message  string   `json:"message"`
 	Location Location `json:"location"`
+	Url      string   `json:"url"`
 }
 
 const (
-	DISTANCE = "200km"
-	INDEX    = "around"
-	TYPE     = "post"
-	ES_URL   = "http://35.226.93.45:9200"
+	DISTANCE    = "200km"
+	INDEX       = "around"
+	TYPE        = "post"
+	BUCKET_NAME = "post-images-around201805"
+
+	ES_URL = "http://35.184.254.47:9200"
 )
 
 func main() {
@@ -81,19 +87,60 @@ func main() {
 func handlerPost(w http.ResponseWriter, r *http.Request) {
 	fmt.Println("Received one post request")
 
-	decoder := json.NewDecoder(r.Body)
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 
-	var p Post
-	if err := decoder.Decode(&p); err != nil {
-		panic(err)
+	//32 左移20位 2^20 = 1024 * 1024 = 1M 一共32M
+	r.ParseMultipartForm(32 << 20)
+
+	fmt.Printf("Received one post request %s\n", r.FormValue("message"))
+
+	lat, _ := strconv.ParseFloat(r.FormValue("lat"), 64)
+	lon, _ := strconv.ParseFloat(r.FormValue("lon"), 64)
+
+	p := &Post{
+		User:    "1111",
+		Message: r.FormValue("message"),
+		Location: Location{
+			Lat: lat,
+			Lon: lon,
+		},
 	}
+	// decoder := json.NewDecoder(r.Body)
+
+	// var p Post
+	// if err := decoder.Decode(&p); err != nil {
+	// 	panic(err)
+	// }
 	//Fprintf F = File. write to file. the first parameter is a io writer.
-	fmt.Fprintf(w, "Post received: %s\n", p.Message)
 
 	id := uuid.New()
 
+	file, _, err := r.FormFile("image")
+	if err != nil {
+		http.Error(w, "Image is not available", http.StatusInternalServerError)
+		fmt.Printf("Image is not available %v.\n", err)
+		return
+	}
+	defer file.Close()
+
+	//go 运行时得到可以访问GCS的一个context
+	ctx := context.Background()
+
+	_, attrs, err := saveToGCS(ctx, file, BUCKET_NAME, id)
+	if err != nil {
+		http.Error(w, "GCS is not setup", http.StatusInternalServerError)
+		fmt.Printf("GCS is not setup %v\n", err)
+		panic(err)
+	}
+
+	p.Url = attrs.MediaLink
 	// Save to ES
-	saveToES(&p, &id)
+	saveToES(p, &id)
+
+	// fmt.Fprintf(w, "Post successful: %v\n", p.Message)
+
 }
 
 func handlerSearch(w http.ResponseWriter, r *http.Request) {
@@ -172,6 +219,37 @@ func handlerSearch(w http.ResponseWriter, r *http.Request) {
 	// fmt.Fprintf(w, "Search received: %f %f", lat, lon)
 }
 
+func saveToGCS(ctx context.Context, r io.Reader, bucketName, name string) (*storage.ObjectHandle, *storage.ObjectAttrs, error) {
+	client, err := storage.NewClient(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	bucket := client.Bucket(bucketName)
+	if _, err := bucket.Attrs(ctx); err != nil {
+		return nil, nil, err
+	}
+
+	obj := bucket.Object(name)
+	wc := obj.NewWriter(ctx)
+	if _, err = io.Copy(wc, r); err != nil {
+		return nil, nil, err
+	}
+
+	if err := wc.Close(); err != nil {
+		return nil, nil, err
+	}
+
+	if err := obj.ACL().Set(ctx, storage.AllUsers, storage.RoleReader); err != nil {
+		return nil, nil, err
+	}
+
+	attrs, err := obj.Attrs(ctx)
+
+	fmt.Printf("Post is saved to GCS: %s\n", attrs.MediaLink)
+	return obj, attrs, err
+}
+
 func saveToES(p *Post, id *string) {
 	es_client, err := elastic.NewClient(elastic.SetURL(ES_URL), elastic.SetSniff(false))
 
@@ -191,5 +269,5 @@ func saveToES(p *Post, id *string) {
 		panic(err1)
 	}
 
-	fmt.Printf("Post is saved to index: %s\n", p.Message)
+	fmt.Printf("Post is saved to Elasticsearch INDEX -  %s: %s\n", INDEX, p.Message)
 }
