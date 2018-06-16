@@ -13,6 +13,7 @@ import (
 	jwt "github.com/dgrijalva/jwt-go"
 	"github.com/gorilla/mux"
 
+	"cloud.google.com/go/bigtable"
 	"cloud.google.com/go/storage"
 	"github.com/pborman/uuid"
 	"golang.org/x/net/context"
@@ -36,8 +37,9 @@ const (
 	INDEX       = "around"
 	TYPE        = "post"
 	BUCKET_NAME = "post-images-around201805"
-
-	ES_URL = "http://104.197.142.219:9200"
+	PROJECT_ID  = "around201805"
+	BT_INSTANCE = "around201805-post"
+	ES_URL      = "http://35.202.51.192:9200"
 )
 
 var mySigningKey = []byte("unknown")
@@ -185,6 +187,8 @@ func handlerPost(w http.ResponseWriter, r *http.Request) {
 
 	// fmt.Fprintf(w, "Post successful: %v\n", p.Message)
 
+	saveToBigTable(p, id)
+
 }
 
 func handlerSearch(w http.ResponseWriter, r *http.Request) {
@@ -315,4 +319,31 @@ func saveToES(p *Post, id *string) {
 	}
 
 	fmt.Printf("Post is saved to Elasticsearch INDEX -  %s: %s\n", INDEX, p.Message)
+}
+
+func saveToBigTable(p *Post, id string) {
+	ctx := context.Background()
+	// you must update project name here
+	bt_client, err := bigtable.NewClient(ctx, PROJECT_ID, BT_INSTANCE)
+	if err != nil {
+		panic(err)
+		return
+	}
+
+	tbl := bt_client.Open("post")
+	mut := bigtable.NewMutation()
+	t := bigtable.Now()
+
+	mut.Set("post", "user", t, []byte(p.User))
+	mut.Set("post", "message", t, []byte(p.Message))
+	mut.Set("location", "lat", t, []byte(strconv.FormatFloat(p.Location.Lat, 'f', -1, 64)))
+	mut.Set("location", "lon", t, []byte(strconv.FormatFloat(p.Location.Lon, 'f', -1, 64)))
+
+	err = tbl.Apply(ctx, id, mut)
+	if err != nil {
+		panic(err)
+		return
+	}
+	fmt.Printf("Post is saved to BigTable: %s\n", p.Message)
+
 }
